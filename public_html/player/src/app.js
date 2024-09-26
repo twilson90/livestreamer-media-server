@@ -1,10 +1,4 @@
-import * as dom_utils from "@hedgehog90/utils/dom";
-import * as utils from "@hedgehog90/utils";
-import './jquery-global.js';
-import Hls from "hls.js";
-import videojs from "video.js/core";
-import "video.js/dist/video-js.css";
-import '@fortawesome/fontawesome-free/js/all.js';
+import { dom_utils, utils, $, Hls, videojs } from "./core.js";
 import './app.scss';
 
 (async()=>{
@@ -498,15 +492,15 @@ import './app.scss';
       
       /** @type {import("video.js/dist/types/live-tracker").default}*/
       var liveTracker = player.liveTracker;
-      var get_time_until_live_edge_area = ()=>{
+      var get_time_until_live_edge_area = (use_latency)=>{
         const liveCurrentTime = utils.try(()=>liveTracker.liveCurrentTime(), 0);
         const currentTime = player.currentTime();
-        return Math.max(0, Math.abs(liveCurrentTime - currentTime) - hls.targetLatency);
+        return Math.max(0, Math.abs(liveCurrentTime - currentTime) - (use_latency ? hls.targetLatency/2 : 0));
       };
       var update = ()=>{
         // liveTracker.options_.liveTolerance = hls.targetLatency ? (hls.targetLatency) : liveTracker.options_.liveTolerance; // good to have a bit of extra buffer
         
-        var d = get_time_until_live_edge_area();
+        var d = get_time_until_live_edge_area(true);
         var behindLiveEdge = liveTracker.behindLiveEdge();
         
         var rate = player.playbackRate();
@@ -547,16 +541,13 @@ import './app.scss';
 
       player.ready(()=>{
         if (play) {
-          utils.promise_timeout(player.play(), 2000).catch((error)=>{
-            console.log("Autoplay was disallowed.");
-            // update_play_button();
-          })
+          new Promise((resolve,reject)=>{
+            player.play().then(resolve);
+            setTimeout(()=>reject("Autoplay was disallowed."), 2000);
+          }).catch((e)=>console.error(e))
         }
       });
-      player.on("error", (e)=>{
-        console.log(e);
-        // player.error() // message and code
-      });
+      player.on("error", console.error);
     } else if (video_el.canPlayType('application/vnd.apple.mpegurl')) {
       video_el.src = src;
     }

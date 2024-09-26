@@ -1,26 +1,20 @@
-const os = require("node:os");
-const path = require("node:path");
-const express = require("express");
-const events = require("node:events");
-const readline = require("node:readline");
-const execa = require("execa");
-const fs = require("fs-extra");
-const bodyParser = require("body-parser");
-const compression = require("compression");
-const { glob } = require("glob");
-const NodeMediaServer = require("node-media-server");
-const nms_core_logger = require("node-media-server/src/node_core_logger");
-const nms_ctx = require("node-media-server/src/node_core_ctx");
-const NodeFlvSession = require("node-media-server/src/node_flv_session");
-const NodeRtmpSession = require("node-media-server/src/node_rtmp_session");
+import os from "node:os";
+import path from "node:path";
+import express, { Router } from "express";
+import events from "node:events";
+import readline from "node:readline";
+import fs from "fs-extra";
+import bodyParser from "body-parser";
+import compression from "compression";
+import {glob} from "glob";
+import NodeMediaServer from "node-media-server";
+import nms_core_logger from "node-media-server/src/node_core_logger.js";
+import nms_ctx from "node-media-server/src/node_core_ctx.js";
+import NodeFlvSession from "node-media-server/src/node_flv_session.js";
+import NodeRtmpSession from "node-media-server/src/node_rtmp_session.js";
+import core, { utils, Blocklist, WebServer, FFMPEGWrapper } from "@livestreamer/core";
 
-const utils = require("@livestreamer/core/utils");
-const App = require("@livestreamer/core/App");
-const Blocklist = require("@livestreamer/core/Blocklist");
-const WebServer = require("@livestreamer/core/WebServer");
-const core = require("@livestreamer/core");
-
-// ----------------
+const __dirname = import.meta.dirname;
 
 const FETCH_TIMEOUT = 60 * 1000;
 const THUMBNAIL_INTERVAL = 60 * 1000;
@@ -146,17 +140,13 @@ const APPNAMES = new Set([
     "test" // test ^ merge with internal
 ]);
 
-class NMSApp extends App {
+class MediaServerApp {
 
     /** @type {Record<string,LiveSessionWrapper>} */
     lives = {};
 
-    constructor(){
-        super("nms");
-    }
-
     init() {
-        this.blocklist_path = path.join(core.appdata_dir, "nms-blocklist");
+        this.blocklist_path = path.join(core.appdata_dir, "media-server-blocklist");
         this.media_dir = path.join(core.appdata_dir, "media");
 
         fs.mkdirSync(this.media_dir, {recursive:true});
@@ -173,7 +163,7 @@ class NMSApp extends App {
 
         this.nms = new NodeMediaServer({
             rtmp: {
-                port: core.conf["nms.rtmp_port"],
+                port: core.conf["media-server.rtmp_port"],
                 chunk_size: 60000,
                 gop_cache: true,
                 ping: 60,
@@ -214,7 +204,7 @@ class NMSApp extends App {
             nms_ctx.stat.outbytes += socket.bytesWritten;
         });
 
-        this.media_router = express.Router();
+        this.media_router = Router();
         this.media_router.use(
             compression({
                 threshold: 0,
@@ -284,7 +274,7 @@ class NMSApp extends App {
         this.nms.on('prePlay', (id, StreamPath, args)=>{
             core.logger.debug(`[NodeEvent on prePlay] id=${id} StreamPath=${StreamPath} args=${JSON.stringify(args)}`);
             var session = this.get_session(id);
-            core.ipc_send("main", "nms.pre-play", session_json(session));
+            core.ipc_send("main", "media-server.pre-play", session_json(session));
         });
         this.nms.on('postPlay', (id, StreamPath, args)=>{
             core.logger.debug(`[NodeEvent on postPlay] id=${id} StreamPath=${StreamPath} args=${JSON.stringify(args)}`);
@@ -300,15 +290,15 @@ class NMSApp extends App {
             var session = this.get_session(id);
             if (!StreamPath.split("/").pop()) session.reject();
             // var key = args.key || StreamPath.replace(/^\/+/, "").replace(/\/+$/, "")
-            /* if (core.conf["nms.test_key"] && args.test_key !== core.conf["nms.test_key"]) {
+            /* if (core.conf["media-server.test_key"] && args.test_key !== core.conf["media-server.test_key"]) {
                 reject(session, `Blocked '${session.ip}' publishing, bad test_key.`);
             } */
-            core.ipc_send("*", "nms.pre-publish", session_json(session));
+            core.ipc_broadcast("media-server.pre-publish", session_json(session));
         });
         this.nms.on('postPublish', async (id, StreamPath, args)=>{
             core.logger.debug(`[NodeEvent on postPublish] id=${id} StreamPath=${StreamPath} args=${JSON.stringify(args)}`);
             var session = this.get_session(id);
-            core.ipc_send("*", "nms.post-publish", session_json(session));
+            core.ipc_broadcast("media-server.post-publish", session_json(session));
             await session_ready(session).catch(()=>{
                 core.logger.error("No video and audio stream detected.");
                 return;
@@ -319,21 +309,21 @@ class NMSApp extends App {
             }
             if (session.appname === "live") {
                 new LiveSessionWrapper(session);
-                core.ipc_send("*", "nms.live-publish");
+                core.ipc_broadcast("media-server.live-publish");
             }
-            core.ipc_send("*", "nms.metadata-publish", session_json(session));
+            core.ipc_broadcast("media-server.metadata-publish", session_json(session));
         });
 
         this.nms.on('donePublish', (id, StreamPath, args)=>{
             core.logger.debug(`[NodeEvent on donePublish] id=${id} StreamPath=${StreamPath} args=${JSON.stringify(args)}`);
             var session = this.get_session(id);
             if (session.live) session.live.end();
-            core.ipc_send("*", "nms.done-publish", session_json(session));
+            core.ipc_broadcast("media-server.done-publish", session_json(session));
         });
 
         var interval = new utils.Interval(()=>{
             this.cleanup_media();
-        }, ()=>core.conf["nms.media_cleanup_interval"] * 1000);
+        }, ()=>core.conf["media-server.media-cleanup-interval"] * 1000);
 
         this.cleanup_media();
 
@@ -369,17 +359,17 @@ class NMSApp extends App {
         var now = Date.now();
         for (var f of files) {
             var p = f.fullpath();
-            if (f.mtimeMs + core.conf["nms.media_expire_time"] * 1000 < now) {
+            if (f.mtimeMs + core.conf["media-server.media_expire_time"] * 1000 < now) {
                 await fs.rm(path.dirname(p), { recursive: true });
             }
         }
     }
 
-    async destroy(){
+    async destroy() {
         for (var live of Object.values(this.lives)) {
-            live.end();
+            await live.end();
         }
-        await this.web.destroy();
+        await this.web.destroy()
     }
 }
 
@@ -401,17 +391,18 @@ function session_ready(session, timeout=20*1000) {
 }
 
 class LiveSessionWrapper extends events.EventEmitter {
-    /** @type {execa.ExecaChildProcess} */
-    trans;
-    session;
+    ffmpeg;
     /** @type {Record<string, LevelM3U8Manifest>} */
     levels = {};
+    session;
     #ended = false;
 
     /** @param {NodeRtmpSession} session */
     constructor(session) {
         super();
         this.session = session;
+        this.ffmpeg = new FFMPEGWrapper();
+
         var [_, appname, id] = session.publishStreamPath.split("/");
         this.appname = appname;
         this.id = id;
@@ -427,11 +418,11 @@ class LiveSessionWrapper extends events.EventEmitter {
         
         let min_height = Math.max(Math.min(...STREAM_CONFIGS.map(c=>c.v.height).filter(c=>c)), this.session.videoHeight || 720);
         this.configs = STREAM_CONFIGS.filter(c=>!c.v.height || c.v.height <= min_height).slice(-4);
-        this.use_hardware = !!core.conf["nms.use_hardware"];
-        this.use_hevc = core.conf["nms.use_hevc"];
-        this.hls_list_size = core.conf["nms.hls_list_size"];
-        this.hls_max_duration = core.conf["nms.hls_max_duration"];
-        this.segment_duration = +core.conf["nms.hls_segment_duration"];
+        this.use_hardware = !!core.conf["media-server.use_hardware"];
+        this.use_hevc = core.conf["media-server.use_hevc"];
+        this.hls_list_size = core.conf["media-server.hls_list_size"];
+        this.hls_max_duration = core.conf["media-server.hls_max_duration"];
+        this.segment_duration = +core.conf["media-server.hls_segment_duration"];
 
         for (var c of this.configs) {
             this.levels[c.name] = new LevelM3U8Manifest(this, c);
@@ -460,8 +451,8 @@ class LiveSessionWrapper extends events.EventEmitter {
                 "-y",
                 thumbnail_path
             );
-            await execa(core.conf["ffmpeg_executable"], ffmpeg_args);
-            this.session.thumbnail_url = `${core.url}/nms/media/${this.session.appname}/${this.id}/thumbnails/${thumbnail_name}`;
+            await utils.execa(core.conf["core.ffmpeg_executable"], ffmpeg_args);
+            this.session.thumbnail_url = `${core.url}/media-server/media/${this.session.appname}/${this.id}/thumbnails/${thumbnail_name}`;
             t++;
         };
         this.last_level.on("new_segment", create_thumbnail);
@@ -483,8 +474,8 @@ class LiveSessionWrapper extends events.EventEmitter {
         ];
         
         const use_hardware = !force_software && this.use_hardware;
-        const hwaccel = use_hardware && core.conf["ffmpeg_hwaccel"];
-        const hwenc = use_hardware && core.conf["ffmpeg_hwenc"];
+        const hwaccel = use_hardware && core.conf["core.ffmpeg_hwaccel"];
+        const hwenc = use_hardware && core.conf["core.ffmpeg_hwenc"];
         if (hwaccel) {
             ffmpeg_args.push(
                 "-hwaccel", hwaccel,
@@ -499,7 +490,7 @@ class LiveSessionWrapper extends events.EventEmitter {
         ffmpeg_args.push(
             // `-re`,
             // "-f", "flv",
-            "-i", `rtmp://127.0.0.1:${core.conf["nms.rtmp_port"]}${this.session.publishStreamPath}`,
+            "-i", `rtmp://127.0.0.1:${core.conf["media-server.rtmp_port"]}${this.session.publishStreamPath}`,
             `-noautoscale`,
             `-ar`, `44100`,
             `-ac`, `2`,
@@ -520,7 +511,7 @@ class LiveSessionWrapper extends events.EventEmitter {
             // `-vsync`, `0`,
 
             // `-movflags`,` +faststart`,
-            "-force_key_frames", `expr:gte(t,n_forced*${core.conf["nms.keyframe_interval"]})`, // keyframe every 2 seconds.
+            "-force_key_frames", `expr:gte(t,n_forced*${core.conf["media-server.keyframe_interval"]})`, // keyframe every 2 seconds.
         );
         if (use_hardware) {
             ffmpeg_args.push(
@@ -554,7 +545,7 @@ class LiveSessionWrapper extends events.EventEmitter {
             if (c.v.width || c.v.height) {
                 ffmpeg_args.push(
                     `-filter:v:${i}`, [
-                        hwenc ? `scale_${core.conf["ffmpeg_hwaccel"]}=${c.v.width||-2}:${c.v.height||-2}` : `scale=${c.v.width||-2}:${c.v.height||-2}`
+                        hwenc ? `scale_${core.conf["core.ffmpeg_hwaccel"]}=${c.v.width||-2}:${c.v.height||-2}` : `scale=${c.v.width||-2}:${c.v.height||-2}`
                     ].join(",")
                 );
             }
@@ -598,18 +589,17 @@ class LiveSessionWrapper extends events.EventEmitter {
         );
 
         core.logger.info(`ffmpeg command:\n ffmpeg ${ffmpeg_args.join(" ")}`);
-        let proc = execa(core.conf["ffmpeg_executable"], ffmpeg_args, {cwd: this.dir});
-        readline.createInterface(proc.stderr).on("line", (line)=>{
+        this.ffmpeg.start(ffmpeg_args, {cwd: this.dir})
+        readline.createInterface(this.ffmpeg.process.stderr).on("line", (line)=>{
             if (line.match(/^\[hls @ .+?\] Opening '.+?' for writing$/)) return;
             core.logger.debug(line);
         });
-        /* proc.catch((e)=>{
+        /* this.trans.catch((e)=>{
             if (!this.#ended && use_hardware) {
                 core.logger.info(`Hardware mode failed, trying force_software=true...`)
                 this.start(true);
             }
         }) */
-        this.trans = proc;
     }
 
     get last_level() {
@@ -634,7 +624,7 @@ class LiveSessionWrapper extends events.EventEmitter {
         clearInterval(this.update_interval);
         for (var v in this.levels) this.levels[v].destroy();
         delete app.lives[this.id];
-        if (this.trans) this.trans.kill();
+        if (this.ffmpeg) this.ffmpeg.destroy();
     }
 }
 
@@ -768,7 +758,7 @@ class LevelM3U8Manifest extends events.EventEmitter {
         var ts = Date.now();
         while (!this.#segments[_HLS_msn] && !this.#ended) {
             await new Promise(r=>this.once("update", r));
-            if (Date.now() > ts + FETCH_TIMEOUT) throw new Error("fuck this is taking ages");
+            if (Date.now() > ts + FETCH_TIMEOUT) throw new Error("This is taking ages.");
         }
         res.header("content-type", "application/vnd.apple.mpegurl");
         res.send(this.#render(_HLS_msn, _HLS_skip));
@@ -786,6 +776,7 @@ class LevelM3U8Manifest extends events.EventEmitter {
     }
 }
 
-const app = module.exports = new NMSApp();
+const app = new MediaServerApp();
+core.init("media-server", app);
 
-core.register(app);
+export default app;
