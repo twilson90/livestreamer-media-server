@@ -161,6 +161,10 @@ class MediaServerApp {
 
         core.set_priority(process.pid, os.constants.priority.PRIORITY_ABOVE_NORMAL);
 
+        core.ipc.respond("published_sessions", ()=>{
+            return [...nms_ctx.sessions.values()].filter(s=>s.isPublishing).map(s=>session_json(s));
+        });
+
         this.nms = new NodeMediaServer({
             rtmp: {
                 port: core.conf["media-server.rtmp_port"],
@@ -242,12 +246,16 @@ class MediaServerApp {
         this.exp.use("/media", this.media_router);
 		this.exp.use('/', express.static(path.join(__dirname, "public_html")));
 
-        core.on("stream.stopped",(stream)=>{
+        var main_streams = {};
+        core.ipc.on("main.stream.started", (stream)=>{
+            main_streams[stream.id] = stream;
+        });
+        core.ipc.on("main.stream.stopped", (stream_id)=>{
+            var stream = main_streams[stream_id];
+            if (!stream) return;
             for (var path of stream.internal_stream_paths) {
-                var session = this.get_session_from_stream_path(path)
-                if (session) {
-                    session.stop();
-                }
+                var session = this.get_session_from_stream_path(path);
+                if (session) session.stop();
             }
         })
 
@@ -274,7 +282,7 @@ class MediaServerApp {
         this.nms.on('prePlay', (id, StreamPath, args)=>{
             core.logger.debug(`[NodeEvent on prePlay] id=${id} StreamPath=${StreamPath} args=${JSON.stringify(args)}`);
             var session = this.get_session(id);
-            core.ipc_send("main", "media-server.pre-play", session_json(session));
+            core.ipc.send("main", "media-server.pre-play", session_json(session));
         });
         this.nms.on('postPlay', (id, StreamPath, args)=>{
             core.logger.debug(`[NodeEvent on postPlay] id=${id} StreamPath=${StreamPath} args=${JSON.stringify(args)}`);
@@ -293,12 +301,12 @@ class MediaServerApp {
             /* if (core.conf["media-server.test_key"] && args.test_key !== core.conf["media-server.test_key"]) {
                 reject(session, `Blocked '${session.ip}' publishing, bad test_key.`);
             } */
-            core.ipc_broadcast("media-server.pre-publish", session_json(session));
+            core.ipc.emit("media-server.pre-publish", session_json(session));
         });
         this.nms.on('postPublish', async (id, StreamPath, args)=>{
             core.logger.debug(`[NodeEvent on postPublish] id=${id} StreamPath=${StreamPath} args=${JSON.stringify(args)}`);
             var session = this.get_session(id);
-            core.ipc_broadcast("media-server.post-publish", session_json(session));
+            core.ipc.emit("media-server.post-publish", session_json(session));
             await session_ready(session).catch(()=>{
                 core.logger.error("No video and audio stream detected.");
                 return;
@@ -309,16 +317,16 @@ class MediaServerApp {
             }
             if (session.appname === "live") {
                 new LiveSessionWrapper(session);
-                core.ipc_broadcast("media-server.live-publish");
+                core.ipc.emit("media-server.live-publish");
             }
-            core.ipc_broadcast("media-server.metadata-publish", session_json(session));
+            core.ipc.emit("media-server.metadata-publish", session_json(session));
         });
 
         this.nms.on('donePublish', (id, StreamPath, args)=>{
             core.logger.debug(`[NodeEvent on donePublish] id=${id} StreamPath=${StreamPath} args=${JSON.stringify(args)}`);
             var session = this.get_session(id);
             if (session.live) session.live.end();
-            core.ipc_broadcast("media-server.done-publish", session_json(session));
+            core.ipc.emit("media-server.done-publish", session_json(session));
         });
 
         var interval = new utils.Interval(()=>{
@@ -328,10 +336,6 @@ class MediaServerApp {
         this.cleanup_media();
 
         this.nms.run();
-    }
-
-    get_published_sessions() {
-        return [...nms_ctx.sessions.values()].filter(s=>s.isPublishing).map(s=>session_json(s));
     }
 
     stop_session(id) {
