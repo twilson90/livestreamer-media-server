@@ -7,7 +7,6 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
-    "@livestreamer/core": "git+https://twilson90/livestreamer-core.git",
     "body-parser": "^1.20.3",
     "chokidar": "^4.0.0",
     "compression": "^1.7.4",
@@ -17,7 +16,6 @@
     "node-media-server": "^2.7.0"
   },
   "devDependencies": {
-    "@fortawesome/fontawesome-free": "^6.6.0",
     "hls.js": "^1.5.15",
     "jquery": "^3.7.1",
     "jquery-ui": "^1.14.0",

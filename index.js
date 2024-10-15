@@ -2,7 +2,7 @@ import os from "node:os";
 import path from "node:path";
 import express, { Router } from "express";
 import events from "node:events";
-import readline from "node:readline";
+import stream from "node:stream";
 import fs from "fs-extra";
 import bodyParser from "body-parser";
 import compression from "compression";
@@ -18,6 +18,7 @@ const __dirname = import.meta.dirname;
 
 const FETCH_TIMEOUT = 60 * 1000;
 const THUMBNAIL_INTERVAL = 60 * 1000;
+const DETECT_CROP = true;
 // const LEVEL_CACHE_LIMIT = 60;
 
 const SESSION_VARS = [
@@ -88,7 +89,7 @@ const SESSION_VARS = [
     "numPlayCache",
     "startTimestamp",
 
-    "thumbnail_url"
+    "live"
 ];
 
 const session_json = (session)=>{
@@ -107,7 +108,7 @@ const session_reject = (session, reason)=>{
 /** @typedef {{width:string, height:string, b:string, codec:string}} VideoConfig */
 /** @typedef {{name:string, v:VideoConfig, a:AudioConfig}} StreamConfig */
 
-/** @type {Record<string,VideoConfig}} */
+/** @type {Record<PropertyKey,VideoConfig}} */
 let VIDEO_CONFIGS = {
     "240p": { "height": 240, "b": "350k" },
     "360p": { "height": 360, "b": "800k" },
@@ -116,7 +117,7 @@ let VIDEO_CONFIGS = {
     "1080p": { "height": 1080, "b": "3000k" }
 };
 
-/** @type {Record<string,AudioConfig}} */
+/** @type {Record<PropertyKey,AudioConfig}} */
 let AUDIO_CONFIGS = {
     "low": { "name":"low", "b": "128k" },
     "high": { "name":"high","b": "160k" },
@@ -142,7 +143,7 @@ const APPNAMES = new Set([
 
 class MediaServerApp {
 
-    /** @type {Record<string,LiveSessionWrapper>} */
+    /** @type {Record<PropertyKey,LiveSessionWrapper>} */
     lives = {};
 
     init() {
@@ -229,9 +230,27 @@ class MediaServerApp {
                         return await live.levels[v].fetch(req, res);
                     }
                 } else {
-                    var new_url =  `/live/${id}/${v}.vod.m3u8`;
-                    console.debug(`redirecting ${req.url} -> ${new_url}`);
-                    req.url = new_url;
+                    var f = path.join(this.media_dir, `live/${id}/${v}.vod.m3u8`);
+                    if (await fs.exists(f)) {
+                        fs.createReadStream(path.join(this.media_dir, `live/${id}/${v}.vod.m3u8`), {encoding: 'utf8'})
+                            .pipe(new stream.Transform({
+                                transform(chunk, encoding, callback) {
+                                    callback(null, chunk);
+                                },
+                                flush(callback) {
+                                    this.push("\n#EXT-X-ENDLIST\n");
+                                    callback();
+                                }
+                            }))
+                            .pipe(res);
+                        // var f = await fs.readFile(path.join(this.media_dir, `live/${id}/${v}.vod.m3u8`), "utf8");
+                        // f += "\n#EXT-X-ENDLIST\n";
+                        res.header("content-type", "application/vnd.apple.mpegurl");
+                        // res.send(f);
+                        return;
+                    }
+                    // console.debug(`redirecting ${req.url} -> ${new_url}`);
+                    // req.url = new_url;
                 }
             }
             next();
@@ -239,12 +258,20 @@ class MediaServerApp {
         this.media_router.use("/", express.static(this.media_dir, {
             maxAge: "2y",
             etag: false,
-            setHeaders: (res, path, stat) => {
+            setHeaders: (res, file_path, stat) => {
                 res.removeHeader("connection");
+                // var metadata = await fs.readFile(file_path+".metadata.json", "utf8").catch(()=>{});
+                // if (metadata) res.setHeader("segment-metadata", metadata);
             }
         }));
         this.exp.use("/media", this.media_router);
 		this.exp.use('/', express.static(path.join(__dirname, "public_html")));
+        this.exp.use('/logo', express.static(path.resolve(core.conf["media-server.logo"])));
+        this.exp.use('/conf', (req, res)=>{
+            res.json({
+                logo_url: core.conf["media-server.logo_url"]
+            });
+        });
 
         var main_streams = {};
         core.ipc.on("main.stream.started", (stream)=>{
@@ -317,15 +344,14 @@ class MediaServerApp {
             }
             if (session.appname === "live") {
                 new LiveSessionWrapper(session);
-                core.ipc.emit("media-server.live-publish");
             }
             core.ipc.emit("media-server.metadata-publish", session_json(session));
         });
 
-        this.nms.on('donePublish', (id, StreamPath, args)=>{
+        this.nms.on('donePublish', async(id, StreamPath, args)=>{
             core.logger.debug(`[NodeEvent on donePublish] id=${id} StreamPath=${StreamPath} args=${JSON.stringify(args)}`);
             var session = this.get_session(id);
-            if (session.live) session.live.end();
+            if (session.live && this.lives[session.live.id]) await this.lives[session.live.id].destroy();
             core.ipc.emit("media-server.done-publish", session_json(session));
         });
 
@@ -343,12 +369,12 @@ class MediaServerApp {
         if (session) session.stop();
     }
 
-    /** @return {(NodeRtmpSession | NodeFlvSession) & {live:LiveSessionWrapper}} */
+    /** @return {(NodeRtmpSession | NodeFlvSession)} */
     get_session(id) {
         return this.nms.getSession(id);
     }
 
-    /** @return {(NodeRtmpSession | NodeFlvSession) & {live:LiveSessionWrapper}} */
+    /** @return {(NodeRtmpSession | NodeFlvSession)} */
     get_session_from_stream_path(path) {
         for (var session of nms_ctx.sessions.values()) {
             if (session.publishStreamPath === path) {
@@ -358,22 +384,24 @@ class MediaServerApp {
     }
 
     async cleanup_media() {
-        var files = (await glob("*/*/index", {cwd: this.media_dir, stat: true, withFileTypes: true }));
-        files.reverse();
+        var dirs = (await glob("*/*", {cwd: this.media_dir, stat: true, withFileTypes: true }));
+        dirs.reverse();
         var now = Date.now();
-        for (var f of files) {
-            var p = f.fullpath();
-            if (f.mtimeMs + core.conf["media-server.media_expire_time"] * 1000 < now) {
-                await fs.rm(path.dirname(p), { recursive: true });
+        for (var dir of dirs) {
+            var files = (await glob("*", {cwd: dir.fullpath(), stat: true, withFileTypes: true }));
+            var f = files.sort((a,b)=>b.mtimeMs-a.mtimeMs)[0]; // get last modified file.
+            if (!f) continue;
+            if (now > f.mtimeMs + (core.conf["media-server.media_expire_time"] * 1000)) {
+                await fs.rm(dir.fullpath(), { recursive: true });
             }
         }
     }
 
     async destroy() {
         for (var live of Object.values(this.lives)) {
-            await live.end();
+            await live.destroy();
         }
-        await this.web.destroy()
+        await this.web.destroy();
     }
 }
 
@@ -396,29 +424,33 @@ function session_ready(session, timeout=20*1000) {
 
 class LiveSessionWrapper extends events.EventEmitter {
     ffmpeg;
-    /** @type {Record<string, LevelM3U8Manifest>} */
+    /** @type {Record<PropertyKey, LevelM3U8Manifest>} */
     levels = {};
+    metadata = {};
     session;
-    #ended = false;
 
     /** @param {NodeRtmpSession} session */
     constructor(session) {
         super();
         this.session = session;
         this.ffmpeg = new FFMPEGWrapper();
-
         var [_, appname, id] = session.publishStreamPath.split("/");
         this.appname = appname;
         this.id = id;
         this.dir = path.join(app.media_dir, appname, id);
-        app.lives[id] = this;
-        session.live = this;
-
-        this.index_path = path.join(this.dir, "index");
         this.thumbnails_dir = path.join(this.dir, "thumbnails");
+        app.lives[id] = this;
+        session.live = {
+            id,
+            url:`${core.url}/media-server/player/index.html?id=${id}`,
+        };
+        this.init();
+    }
+    
+    async init() {
 
-        fs.mkdirSync(this.dir, {recursive:true});
-        fs.mkdirSync(this.thumbnails_dir, {recursive:true});
+        await fs.mkdir(this.dir, {recursive:true});
+        await fs.mkdir(this.thumbnails_dir, {recursive:true});
         
         let min_height = Math.max(Math.min(...STREAM_CONFIGS.map(c=>c.v.height).filter(c=>c)), this.session.videoHeight || 720);
         this.configs = STREAM_CONFIGS.filter(c=>!c.v.height || c.v.height <= min_height).slice(-4);
@@ -456,19 +488,14 @@ class LiveSessionWrapper extends events.EventEmitter {
                 thumbnail_path
             );
             await utils.execa(core.conf["core.ffmpeg_executable"], ffmpeg_args);
-            this.session.thumbnail_url = `${core.url}/media-server/media/${this.session.appname}/${this.id}/thumbnails/${thumbnail_name}`;
+            this.session.live.thumbnail_url = `${core.url}/media-server/media/${this.appname}/${this.id}/thumbnails/${thumbnail_name}`;
             t++;
         };
         this.last_level.on("new_segment", create_thumbnail);
 
-        var n = 0;
-        var write_index = ()=>{
-            fs.writeFile(this.index_path, String(++n), "utf8");
-        };
-        this.update_interval = setInterval(write_index, 10000);
-        write_index();
-
         this.start();
+
+        core.ipc.emit("media-server.live-publish");
     }
 
     start(force_software) {
@@ -541,18 +568,49 @@ class LiveSessionWrapper extends events.EventEmitter {
         // var v_configs = [...new Set(this.configs.map(c=>c.v))];
         // var a_configs = [...new Set(this.configs.map(c=>c.a))];
 
+        var vid = `0:v:0`;
+        // var aid = `0:a:0`;
+        var filter_complex = [];
+        var vmap = {};
+        var video_configs = [...new Set(this.configs.map(c=>c.v))];
+
+        // var amap = {}
+        // var cas = [...new Set(this.configs.map(c=>c.a))];
+        // var fix_id = (id)=>String(id).split(/[^a-z0-9]+/gi).filter(a=>a).join("_");
+
+        filter_complex.push(
+            `[${vid}]split=${video_configs.length}${video_configs.map((c,i)=>`[v${i}]`).join("")}`
+        );
+        video_configs.forEach((cv,i)=>{
+            var needs_scaling = (()=>{
+                let check = {width:this.session.videoWidth, height:this.session.videoHeight}
+                for (var k of ["width", "height"]) {
+                    if (cv[k] && check[k] != cv[k]) return true;
+                }
+                return false;
+            })();
+            let graph;
+            let configs = this.configs.filter(c=>c.v === cv);
+            let out = `v${i}`;
+            if (needs_scaling) {
+                let s = `${cv.width||-2}:${cv.height||-2}`;
+                graph = [
+                    hwenc ? `scale_${core.conf["core.ffmpeg_hwaccel"]}=${s}` : `scale=${s}`
+                ].join(",");
+                out = `vscaled${i}`;
+                filter_complex.push(`[v${i}]${graph}[${out}]`);
+            }
+            for (let c of configs) {
+                vmap[c.name] = `[${out}]`;
+            }
+        });
+        ffmpeg_args.push("-filter_complex", filter_complex.join(";"));
+
         this.configs.forEach((c,i)=>{
-            ffmpeg_args.push("-map", "0:v:0");
+            ffmpeg_args.push("-map", vmap[c.name]);
             ffmpeg_args.push(
                 `-c:v:${i}`, c.v.codec || (hwenc ? `${this.use_hevc?"hevc":"h264"}_${hwenc}` : this.use_hevc ? `libx265` : `libx264`)
             );
-            if (c.v.width || c.v.height) {
-                ffmpeg_args.push(
-                    `-filter:v:${i}`, [
-                        hwenc ? `scale_${core.conf["core.ffmpeg_hwaccel"]}=${c.v.width||-2}:${c.v.height||-2}` : `scale=${c.v.width||-2}:${c.v.height||-2}`
-                    ].join(",")
-                );
-            }
             ffmpeg_args.push(
                 `-b:v:${i}`, c.v.b,
                 `-maxrate:v:${i}`, c.v.b,
@@ -593,9 +651,19 @@ class LiveSessionWrapper extends events.EventEmitter {
         );
 
         core.logger.info(`ffmpeg command:\n ffmpeg ${ffmpeg_args.join(" ")}`);
-        this.ffmpeg.start(ffmpeg_args, {cwd: this.dir})
-        readline.createInterface(this.ffmpeg.process.stderr).on("line", (line)=>{
-            if (line.match(/^\[hls @ .+?\] Opening '.+?' for writing$/)) return;
+        this.ffmpeg.start(ffmpeg_args, {cwd: this.dir});
+        var crop, m;
+        this.ffmpeg.on("line", (line)=>{
+            if (DETECT_CROP) {
+                if (m = line.match(/^\[hls @ .+?\] Opening '(.+?)' for writing$/)) {
+                    if (crop) this.set_metadata(m[1], "crop", crop);
+                    // return;
+                }
+                if (m = line.match(/crop=(.+)/)) {
+                    crop = m[1];
+                    return;
+                }
+            }
             core.logger.debug(line);
         });
         /* this.trans.catch((e)=>{
@@ -616,17 +684,18 @@ class LiveSessionWrapper extends events.EventEmitter {
         if (last_segment_uri) return path.join(this.dir, last_segment_uri);
     }
 
-    async end() {
-        if (this.#ended) return;
-        this.#ended = true;
-        for (var v in this.levels) await this.levels[v].end();
-        this.destroy();
+    set_metadata(segment_uri, k,v) {
+        if (!this.metadata[segment_uri]) this.metadata[segment_uri] = {};
+        this.metadata[segment_uri][k] = v;
+        fs.writeFile(path.join(app.media_dir, this.appname, this.id, segment_uri+".metadata.json"), JSON.stringify(this.metadata[segment_uri]), "utf8");
     }
 
-    destroy() {
+    async destroy() {
         this.emit("destroy");
         clearInterval(this.update_interval);
-        for (var v in this.levels) this.levels[v].destroy();
+        for (var v in this.levels) {
+            await this.levels[v].destroy();
+        }
         delete app.lives[this.id];
         if (this.ffmpeg) this.ffmpeg.destroy();
     }
@@ -636,10 +705,10 @@ class LiveSessionWrapper extends events.EventEmitter {
 class LevelM3U8Manifest extends events.EventEmitter {
     len = 0;
     sep = "\n".charCodeAt(0);
-    #ended = false;
     /** @type {Segment[]} */
     #segments = [];
     #bitrates = [];
+    #destroyed = false;
     // parser = new m3u8Parser.Parser();
     // #cache = new utils.Cache(LEVEL_CACHE_LIMIT);
 
@@ -752,7 +821,6 @@ class LevelM3U8Manifest extends events.EventEmitter {
         this.#segments.slice(start, end).forEach(s=>{
             lines += `#EXTINF:${s.duration.toFixed(6)},\n${s.uri}\n`;
         });
-        if (this.#ended) lines += `#EXT-X-ENDLIST\n`;
         return lines;
     }
     /** @param {import("express").Request} req @param {import("express").Response} res */
@@ -760,7 +828,7 @@ class LevelM3U8Manifest extends events.EventEmitter {
         var _HLS_msn = req.query._HLS_msn || 0;
         var _HLS_skip = req.query._HLS_skip || false;
         var ts = Date.now();
-        while (!this.#segments[_HLS_msn] && !this.#ended) {
+        while (!this.#segments[_HLS_msn] && !this.#destroyed) {
             await new Promise(r=>this.once("update", r));
             if (Date.now() > ts + FETCH_TIMEOUT) throw new Error("This is taking ages.");
         }
@@ -768,14 +836,9 @@ class LevelM3U8Manifest extends events.EventEmitter {
         res.send(this.#render(_HLS_msn, _HLS_skip));
     }
 
-    async end() {
-        if (this.#ended) return;
-        this.#ended = true;
-        clearInterval(this.interval);
+    async destroy() {
+        this.#destroyed = true;
         await this.#append(`#EXT-X-ENDLIST\n`);
-    }
-
-    destroy() {
         clearInterval(this.interval);
     }
 }
